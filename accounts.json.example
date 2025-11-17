@@ -1,0 +1,84 @@
+{
+  "accounts": [
+    {
+      "id": "account_1",
+      "name": "Primary Account",
+      "enabled": true,
+      "cookies": {
+        "ct0": "your_ct0_cookie_for_account_1",
+        "auth_token": "your_auth_token_for_account_1"
+      },
+      "proxy": {
+        "enabled": true,
+        "host": "proxy1.example.com",
+        "port": 8080,
+        "username": "proxy_user_1",
+        "password": "proxy_pass_1"
+      },
+      "rate_limit": {
+        "requests_per_minute": 30,
+        "cooldown_minutes": 5
+      },
+      "health": {
+        "is_healthy": true,
+        "last_check": "2025-01-01T00:00:00Z",
+        "failed_count": 0,
+        "last_success": "2025-01-01T00:00:00Z"
+      }
+    },
+    {
+      "id": "account_2",
+      "name": "Secondary Account",
+      "enabled": true,
+      "cookies": {
+        "ct0": "your_ct0_cookie_for_account_2",
+        "auth_token": "your_auth_token_for_account_2"
+      },
+      "proxy": {
+        "enabled": true,
+        "host": "proxy2.example.com",
+        "port": 8080,
+        "username": "proxy_user_2",
+        "password": "proxy_pass_2"
+      },
+      "rate_limit": {
+        "requests_per_minute": 30,
+        "cooldown_minutes": 5
+      },
+      "health": {
+        "is_healthy": true,
+        "last_check": "2025-01-01T00:00:00Z",
+        "failed_count": 0,
+        "last_success": "2025-01-01T00:00:00Z"
+      }
+    },
+    {
+      "id": "account_3",
+      "name": "Backup Account",
+      "enabled": false,
+      "cookies": {
+        "ct0": "your_ct0_cookie_for_account_3",
+        "auth_token": "your_auth_token_for_account_3"
+      },
+      "proxy": {
+        "enabled": false
+      },
+      "rate_limit": {
+        "requests_per_minute": 20,
+        "cooldown_minutes": 10
+      },
+      "health": {
+        "is_healthy": true,
+        "last_check": "2025-01-01T00:00:00Z",
+        "failed_count": 0,
+        "last_success": "2025-01-01T00:00:00Z"
+      }
+    }
+  ],
+  "global_settings": {
+    "max_concurrent_accounts": 2,
+    "account_cooldown_minutes": 15,
+    "proxy_rotation_enabled": true,
+    "health_check_interval_minutes": 5
+  }
+}
