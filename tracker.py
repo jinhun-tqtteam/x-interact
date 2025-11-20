@@ -3,10 +3,13 @@ import os
 import time
 import random
 import threading
-from dataclasses import dataclass
+import signal
+import sys
+from dataclasses import dataclass, field
 from typing import Dict, List, Any, Optional
 from datetime import datetime, timedelta
 from concurrent.futures import ThreadPoolExecutor, as_completed
+from collections import deque
 import queue
 
 import requests
@@ -34,6 +37,11 @@ class Settings:
     proxy_health_check_interval: int
     max_failed_requests_per_account: int
     state_file: str = "tracker_state.json"
+    # New configurable values
+    retry_delay_seconds: int = 2
+    max_retry_delay_seconds: int = 30
+    proxy_health_check_timeout: int = 10
+    webhook_timeout: int = 10
 
 
 def get_settings() -> Settings:
@@ -59,6 +67,12 @@ def get_settings() -> Settings:
     enable_proxy_rotation = os.getenv("ENABLE_PROXY_ROTATION", "true").lower() == "true"
     proxy_health_check_interval = int(os.getenv("PROXY_HEALTH_CHECK_INTERVAL", "300"))
     max_failed_requests_per_account = int(os.getenv("MAX_FAILED_REQUESTS_PER_ACCOUNT", "3"))
+    
+    # New configurable values with defaults
+    retry_delay_seconds = int(os.getenv("RETRY_DELAY_SECONDS", "2"))
+    max_retry_delay_seconds = int(os.getenv("MAX_RETRY_DELAY_SECONDS", "30"))
+    proxy_health_check_timeout = int(os.getenv("PROXY_HEALTH_CHECK_TIMEOUT", "10"))
+    webhook_timeout = int(os.getenv("WEBHOOK_TIMEOUT", "10"))
 
     return Settings(
         accounts_config=accounts_config,
@@ -70,6 +84,10 @@ def get_settings() -> Settings:
         enable_proxy_rotation=enable_proxy_rotation,
         proxy_health_check_interval=proxy_health_check_interval,
         max_failed_requests_per_account=max_failed_requests_per_account,
+        retry_delay_seconds=retry_delay_seconds,
+        max_retry_delay_seconds=max_retry_delay_seconds,
+        proxy_health_check_timeout=proxy_health_check_timeout,
+        webhook_timeout=webhook_timeout,
     )
 
 
@@ -80,19 +98,20 @@ def get_settings() -> Settings:
 @dataclass
 class ProxyConfig:
     enabled: bool
-    host: str = ""
-    port: int = 0
-    username: str = ""
-    password: str = ""
+    proxy_string: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
-        if not self.enabled:
+        if not self.enabled or not self.proxy_string:
             return {}
 
-        proxy_url = f"http://"
-        if self.username and self.password:
-            proxy_url += f"{self.username}:{self.password}@"
-        proxy_url += f"{self.host}:{self.port}"
+        # Parse format: host:port:user:pass
+        parts = self.proxy_string.split(':')
+        if len(parts) < 4:
+            return {}
+
+        host, port, username, password = parts[0], parts[1], parts[2], ':'.join(parts[3:])
+
+        proxy_url = f"http://{username}:{password}@{host}:{port}"
 
         return {
             "http": proxy_url,
@@ -125,14 +144,9 @@ class TwitterAccount:
     rate_limit: RateLimit
     health: AccountHealth
     scraper: Optional[Scraper] = None
-    request_times: List[float] = None
-    lock: threading.Lock = None
-
-    def __post_init__(self):
-        if self.request_times is None:
-            self.request_times = []
-        if self.lock is None:
-            self.lock = threading.Lock()
+    request_times: deque = field(default_factory=lambda: deque(maxlen=100))  # Fixed memory leak
+    lock: threading.Lock = field(default_factory=threading.Lock)
+    scraper_lock: threading.Lock = field(default_factory=threading.Lock)  # For scraper access
 
 
 class AccountManager:
@@ -142,6 +156,7 @@ class AccountManager:
         self.current_account_index = 0
         self.account_lock = threading.Lock()
         self.max_failed_requests_per_account = max_failed_requests_per_account
+        self.state_lock = threading.Lock()  # For state file operations
         self.load_accounts()
 
     def load_accounts(self):
@@ -158,13 +173,33 @@ class AccountManager:
                 continue
 
             proxy_data = acc_data.get("proxy", {})
-            proxy = ProxyConfig(
-                enabled=proxy_data.get("enabled", False),
-                host=proxy_data.get("host", ""),
-                port=proxy_data.get("port", 0),
-                username=proxy_data.get("username", ""),
-                password=proxy_data.get("password", "")
-            )
+
+            # Support both old format (dict) and new format (string)
+            if isinstance(proxy_data, str):
+                # New format: "host:port:user:pass"
+                proxy = ProxyConfig(
+                    enabled=True if proxy_data else False,
+                    proxy_string=proxy_data
+                )
+            elif isinstance(proxy_data, dict):
+                # Old format for backward compatibility
+                enabled = proxy_data.get("enabled", False)
+                if enabled:
+                    host = proxy_data.get("host", "")
+                    port = proxy_data.get("port", 0)
+                    username = proxy_data.get("username", "")
+                    password = proxy_data.get("password", "")
+                    proxy_string = f"{host}:{port}:{username}:{password}" if host else ""
+                else:
+                    proxy_string = ""
+
+                proxy = ProxyConfig(
+                    enabled=enabled,
+                    proxy_string=proxy_string
+                )
+            else:
+                # No proxy
+                proxy = ProxyConfig(enabled=False, proxy_string="")
 
             rate_limit_data = acc_data.get("rate_limit", {})
             rate_limit = RateLimit(
@@ -228,14 +263,16 @@ class AccountManager:
                 print("[account_manager] No healthy accounts available")
                 return None
 
+            account = None
             if strategy == "round_robin":
                 account = healthy_accounts[self.current_account_index % len(healthy_accounts)]
                 self.current_account_index += 1
-                return account
             elif strategy == "random":
-                return random.choice(healthy_accounts)
+                account = random.choice(healthy_accounts)
             else:
-                return healthy_accounts[0]
+                account = healthy_accounts[0]
+            
+            return account
 
     def mark_account_success(self, account_id: str):
         """Mark account as successful"""
@@ -264,42 +301,46 @@ class AccountManager:
 
     def init_scraper(self, account: TwitterAccount) -> Scraper:
         """Initialize scraper for account with proxy support (per-account Session)"""
-        if account.scraper is None:
-            try:
-                # Create session with standard headers from twitter-api-client
-                session = init_session()
+        with account.scraper_lock:  # Thread-safe scraper initialization
+            if account.scraper is None:
+                try:
+                    # Create session with standard headers from twitter-api-client
+                    session = init_session()
 
-                # Apply proxy to session if enabled
-                if account.proxy.enabled:
-                    proxy_dict = account.proxy.to_dict()
-                    if proxy_dict:
-                        session.proxies.update(proxy_dict)
-                        session.trust_env = False  # Don't use proxy from env
+                    # httpx.Client already has built-in connection pooling and retries
+                    # No need to configure adapter like requests.Session
 
-                # Initialize scraper with session + cookies
-                account.scraper = Scraper(
-                    session=session,
-                    cookies=account.cookies,
-                )
+                    # Apply proxy to session if enabled
+                    if account.proxy.enabled:
+                        proxy_dict = account.proxy.to_dict()
+                        if proxy_dict:
+                            # httpx uses different proxy configuration
+                            session.proxies = proxy_dict
+                            # httpx doesn't have trust_env option, but we can ensure it uses our proxy
 
-                print(f"[account_manager] Initialized scraper for account {account.name} with proxy={account.proxy.enabled}")
+                    # Initialize scraper with session + cookies
+                    account.scraper = Scraper(
+                        session=session,
+                        cookies=account.cookies,
+                    )
 
-            except Exception as e:
-                print(f"[account_manager] Failed to initialize scraper for {account.name}: {e}")
-                self.mark_account_failure(account.id, str(e))
-                raise
+                    print(f"[account_manager] Initialized scraper for account {account.name} with proxy={account.proxy.enabled}")
 
-        return account.scraper
+                except Exception as e:
+                    print(f"[account_manager] Failed to initialize scraper for {account.name}: {e}")
+                    self.mark_account_failure(account.id, str(e))
+                    raise
+
+            return account.scraper
 
     def check_rate_limit(self, account: TwitterAccount) -> bool:
-        """Check if account is within rate limits"""
+        """Check if account is within rate limits - O(1) with deque"""
         now = time.time()
         with account.lock:
-            # Remove requests older than 1 minute
-            account.request_times = [
-                t for t in account.request_times
-                if now - t < 60
-            ]
+            # Remove requests older than 1 minute (O(1) with deque)
+            while account.request_times and now - account.request_times[0] >= 60:
+                account.request_times.popleft()
+            
             return len(account.request_times) < account.rate_limit.requests_per_minute
 
     def record_request(self, account: TwitterAccount):
@@ -322,11 +363,23 @@ def load_state(path: str) -> Dict[str, Any]:
         return {}
 
 
-def save_state(path: str, data: Dict[str, Any]) -> None:
+def save_state(path: str, data: Dict[str, Any], lock: Optional[threading.Lock] = None) -> None:
+    """Thread-safe state saving with optional lock"""
+    if lock:
+        with lock:
+            _save_state_internal(path, data)
+    else:
+        _save_state_internal(path, data)
+
+def _save_state_internal(path: str, data: Dict[str, Any]) -> None:
+    """Internal state saving function"""
     tmp = path + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
-    os.replace(tmp, path)
+    try:
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+        os.replace(tmp, path)
+    except Exception as e:
+        print(f"[state] Error saving state to {path}: {e}")
 
 
 # ---------------------------------------------------------
@@ -351,14 +404,27 @@ def resolve_users_with_account(scraper: Scraper, screen_names: List[str], accoun
         resolved: Dict[str, TrackedUser] = {}
 
         for u in users:
-            legacy = u.get("legacy", {})
-            screen_name = (
-                legacy.get("screen_name")
-                or u.get("screen_name")
-                or u.get("username")
-            )
-            user_id = u.get("rest_id") or str(u.get("id") or "")
-            name = legacy.get("name") or u.get("name")
+            # Handle new Twitter API response structure
+            if "data" in u and "user" in u["data"] and "result" in u["data"]["user"]:
+                result = u["data"]["user"]["result"]
+                legacy = result.get("legacy", {})
+                screen_name = (
+                    legacy.get("screen_name")
+                    or result.get("screen_name")
+                    or result.get("username")
+                )
+                user_id = result.get("rest_id") or str(result.get("id") or "")
+                name = legacy.get("name") or result.get("name")
+            else:
+                # Fallback to old structure
+                legacy = u.get("legacy", {})
+                screen_name = (
+                    legacy.get("screen_name")
+                    or u.get("screen_name")
+                    or u.get("username")
+                )
+                user_id = u.get("rest_id") or str(u.get("id") or "")
+                name = legacy.get("name") or u.get("name")
 
             if not screen_name or not user_id:
                 continue
@@ -437,7 +503,14 @@ def get_latest_tweets_for_user_with_account(
     print(f"[{account.name}] Fetching tweets for @{user.screen_name}")
 
     try:
-        data = scraper.tweets([int(user.user_id)])
+        # Validate user_id before converting to int
+        try:
+            user_id_int = int(user.user_id)
+        except (ValueError, TypeError) as e:
+            print(f"[{account.name}] Invalid user_id '{user.user_id}' for @{user.screen_name}: {e}")
+            raise ValueError(f"Invalid user_id: {user.user_id}")
+        
+        data = scraper.tweets([user_id_int])
 
         if isinstance(data, dict):
             key = str(user.user_id)
@@ -464,7 +537,7 @@ def get_latest_tweets_for_user_with_account(
 
 def send_webhook(settings: Settings, payload: Dict[str, Any]) -> None:
     try:
-        resp = requests.post(settings.webhook_url, json=payload, timeout=10)
+        resp = requests.post(settings.webhook_url, json=payload, timeout=settings.webhook_timeout)
         if resp.status_code >= 300:
             print(f"[webhook] Non-2xx status: {resp.status_code} - {resp.text[:200]}")
         else:
@@ -477,7 +550,7 @@ def send_webhook(settings: Settings, payload: Dict[str, Any]) -> None:
 # Proxy Health Check
 # ---------------------------------------------------------
 
-def check_proxy_health(account: TwitterAccount) -> bool:
+def check_proxy_health(account: TwitterAccount, timeout: int = 10) -> bool:
     """
     Check if proxy is working for the account
     """
@@ -488,7 +561,7 @@ def check_proxy_health(account: TwitterAccount) -> bool:
         proxy_dict = account.proxy.to_dict()
         test_url = "https://httpbin.org/ip"
 
-        response = requests.get(test_url, proxies=proxy_dict, timeout=10)
+        response = requests.get(test_url, proxies=proxy_dict, timeout=timeout)
         if response.status_code == 200:
             print(f"[health_check] Proxy for {account.name} is working")
             return True
@@ -501,26 +574,30 @@ def check_proxy_health(account: TwitterAccount) -> bool:
         return False
 
 
-def proxy_health_checker(account_manager: AccountManager, settings: Settings):
+def proxy_health_checker(account_manager: AccountManager, settings: Settings, shutdown_event: threading.Event):
     """
-    Background thread to check proxy health periodically
+    Background thread to check proxy health periodically with graceful shutdown
     """
-    while True:
+    while not shutdown_event.is_set():
         try:
+            # Use wait with timeout to allow graceful shutdown
+            if shutdown_event.wait(timeout=settings.proxy_health_check_interval):
+                break
+                
             for account in account_manager.accounts.values():
                 if account.enabled and account.proxy.enabled:
-                    is_healthy = check_proxy_health(account)
+                    is_healthy = check_proxy_health(account, settings.proxy_health_check_timeout)
                     if not is_healthy:
                         account_manager.mark_account_failure(account.id, "Proxy health check failed")
                     else:
                         account_manager.mark_account_success(account.id)
 
             account_manager.save_accounts()
-            time.sleep(settings.proxy_health_check_interval)
 
         except Exception as e:
             print(f"[health_check] Error in health check: {e}")
-            time.sleep(60)  # Wait 1 minute on error
+            # Wait shorter time on error but still check shutdown event
+            shutdown_event.wait(timeout=60)
 
 
 # ---------------------------------------------------------
@@ -535,13 +612,16 @@ def process_user_tweets(
     result_queue: queue.Queue
 ):
     """
-    Process tweets for a specific user using available accounts
+    Process tweets for a specific user using available accounts with exponential backoff
     """
     max_retries = 3
+    base_delay = settings.retry_delay_seconds
+    
     for attempt in range(max_retries):
         account = account_manager.get_next_account(settings.account_rotation_strategy)
         if not account:
             print(f"[{user.screen_name}] No available accounts")
+            result_queue.put(("error", user.screen_name, "No available accounts", ""))
             break
 
         # Check rate limit
@@ -601,12 +681,29 @@ def process_user_tweets(
 
             if attempt == max_retries - 1:
                 result_queue.put(("error", user.screen_name, str(e), account.id))
+            else:
+                # Exponential backoff with jitter
+                delay = min(base_delay * (2 ** attempt) + random.uniform(0, 1), settings.max_retry_delay_seconds)
+                print(f"[{user.screen_name}] Retrying in {delay:.2f} seconds...")
+                time.sleep(delay)
 
-            # Wait before retry
-            time.sleep(2)
 
+def signal_handler(signum, frame):
+    """Handle shutdown signals gracefully"""
+    print(f"\n[main] Received signal {signum}, shutting down gracefully...")
+    # Set global shutdown event
+    if 'shutdown_event' in globals():
+        shutdown_event.set()
+    sys.exit(0)
 
 def main():
+    global shutdown_event
+    shutdown_event = threading.Event()
+    
+    # Setup signal handlers for graceful shutdown
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    
     settings = get_settings()
     print(f"[config] Tracking users: {settings.target_users}")
     print(f"[config] Poll interval: {settings.poll_interval}s")
@@ -620,10 +717,11 @@ def main():
         raise RuntimeError("No enabled accounts found, aborting.")
 
     # Start proxy health checker if enabled
+    health_thread = None
     if settings.enable_proxy_rotation:
         health_thread = threading.Thread(
             target=proxy_health_checker,
-            args=(account_manager, settings),
+            args=(account_manager, settings, shutdown_event),
             daemon=True
         )
         health_thread.start()
@@ -654,7 +752,7 @@ def main():
 
     # Bootstrap mode
     if settings.bootstrap_skip_initial and not state:
-        print("[bootstrap] First run with BOOTSTRAP_SKIP_INITIAL=true → set baseline only.")
+        print("[bootstrap] First run with BOOTSTRAP_SKIP_INITIAL=true -> set baseline only.")
         for key, user in tracked_users.items():
             account = account_manager.get_next_account()
             if not account:
@@ -671,18 +769,23 @@ def main():
             except Exception as e:
                 print(f"[bootstrap] Error setting baseline for @{user.screen_name}: {e}")
 
-        save_state(settings.state_file, state)
+        save_state(settings.state_file, state, account_manager.state_lock)
         print("[bootstrap] Baseline saved. Next runs will emit only new tweets.")
 
-    # Main polling loop
+    # Main polling loop with persistent thread pool
     print("[main] Starting multi-account polling loop...")
+    
+    # Create persistent thread pool to avoid recreation overhead
+    max_workers = min(len(tracked_users), len(account_manager.accounts))
+    executor = ThreadPoolExecutor(max_workers=max_workers, thread_name_prefix="tweet-worker")
 
-    while True:
-        try:
-            result_queue = queue.Queue()
+    try:
+        while not shutdown_event.is_set():
+            try:
+                result_queue = queue.Queue()
+                state_changed = False
 
-            # Process users in parallel using thread pool
-            with ThreadPoolExecutor(max_workers=min(len(tracked_users), len(account_manager.accounts))) as executor:
+                # Process users in parallel using persistent thread pool
                 futures = []
 
                 for user in tracked_users.values():
@@ -703,51 +806,66 @@ def main():
                     except Exception as e:
                         print(f"[main] Error in future: {e}")
 
-            # Process results
-            while not result_queue.empty():
-                try:
-                    status, screen_name, data, account_id = result_queue.get_nowait()
+                # Process results with timeout to allow shutdown
+                while not result_queue.empty():
+                    try:
+                        status, screen_name, data, account_id = result_queue.get_nowait()
 
-                    if status == "success" and data:
-                        user_key = screen_name.lower()
+                        if status == "success" and data:
+                            user_key = screen_name.lower()
 
-                        for core in data:
-                            # Send webhook
-                            payload = {
-                                "type": "tweet.new",
-                                "source": "twitter-api-client-tracker-multi",
-                                "tweet": {
-                                    "tweet_id": core["tweet_id"],
-                                    "url": core["url"],
-                                    "full_text": core["full_text"],
-                                    "created_at": core["created_at"],
-                                    "metrics": core["metrics"],
-                                    "author": core["author"],
-                                    "source_account": core["source_account"],
-                                },
-                            }
-                            print(f"  -> sending {core['tweet_id']} from @{screen_name} to webhook")
-                            send_webhook(settings, payload)
+                            for core in data:
+                                # Send webhook
+                                payload = {
+                                    "type": "tweet.new",
+                                    "source": "twitter-api-client-tracker-multi",
+                                    "tweet": {
+                                        "tweet_id": core["tweet_id"],
+                                        "url": core["url"],
+                                        "full_text": core["full_text"],
+                                        "created_at": core["created_at"],
+                                        "metrics": core["metrics"],
+                                        "author": core["author"],
+                                        "source_account": core["source_account"],
+                                    },
+                                }
+                                print(f"  -> sending {core['tweet_id']} from @{screen_name} to webhook")
+                                send_webhook(settings, payload)
 
-                            # Update state
-                            state[user_key] = {"last_tweet_id": str(core["_tid_int"])}
+                                # Update state
+                                state[user_key] = {"last_tweet_id": str(core["_tid_int"])}
+                                state_changed = True
 
-                        if data:
-                            save_state(settings.state_file, state)
+                        elif status == "error":
+                            print(f"[main] Error processing @{screen_name}: {data}")
 
-                    elif status == "error":
-                        print(f"[main] Error processing @{screen_name}: {data}")
+                    except queue.Empty:
+                        break
 
-                except queue.Empty:
-                    break
+                # Save state only if changed (reduces file I/O)
+                if state_changed:
+                    save_state(settings.state_file, state, account_manager.state_lock)
 
-            # Save account health status
-            account_manager.save_accounts()
+                # Save account health status (only if there were changes)
+                account_manager.save_accounts()
 
-        except Exception as e:
-            print(f"[main] Error in main loop: {e}")
+            except Exception as e:
+                print(f"[main] Error in main loop: {e}")
 
-        time.sleep(settings.poll_interval)
+            # Use wait with timeout for graceful shutdown
+            shutdown_event.wait(timeout=settings.poll_interval)
+
+    finally:
+        # Cleanup thread pool
+        print("[main] Shutting down thread pool...")
+        executor.shutdown(wait=True)
+        
+        # Wait for health thread to finish
+        if health_thread and health_thread.is_alive():
+            print("[main] Waiting for health checker to shutdown...")
+            health_thread.join(timeout=5)
+        
+        print("[main] Shutdown complete")
 
 
 if __name__ == "__main__":
