@@ -9,9 +9,8 @@ services:
       - ./.env:/app/.env
       - ./accounts.json:/app/accounts.json
       - ./tracker_state.json:/app/tracker_state.json
-    # Optional: If you want to see logs immediately
-    # logging:
-    #   driver: "json-file"
-    #   options:
-    #     max-size: "10m"
-    #     max-file: "3"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"

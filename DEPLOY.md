@@ -53,13 +53,44 @@ When you have pushed new code to the repository, simply run this command on the 
 sh deploy.sh
 ```
 
-This script will:
-1.  Pull the latest code.
-2.  Rebuild the Docker image.
-3.  Restart the container.
+This enhanced script will:
+1.  **Pre-deployment checks**: Verify `.env`, `accounts.json`, Docker availability
+2.  **Backup state files**: Auto-backup `tracker_state.json` (keeps last 5)
+3.  **Pull latest code** from repository
+4.  **Rebuild Docker image** with latest changes
+5.  **Gracefully restart** container
+6.  **Post-deployment verification**: Check container health and logs
+7.  **Show deployment summary** with useful commands
+
+## Features
+
+### 🏥 Health Checks
+The container now includes automated health checks:
+- Runs every 30 seconds
+- Verifies Python runtime is functional
+- Automatic restart if health check fails 3 times
+- View health status: `docker inspect x-interact-tracker`
+
+### 📝 Log Rotation
+Automatic log management to prevent disk space issues:
+- Max log file size: 10MB
+- Keeps last 3 log files
+- Old logs automatically rotated
+
+### 💾 Automatic Backups
+State files are automatically backed up during deployment:
+- Stored in `backups/` directory
+- Timestamped backups
+- Keeps last 5 backups automatically
 
 ## Useful Commands
 
 - **View Logs**: `docker compose logs -f`
+- **View Last N Lines**: `docker compose logs --tail=50`
 - **Stop App**: `docker compose down`
 - **Restart App**: `docker compose restart`
+- **Check Status**: `docker compose ps`
+- **Check Health**: `docker inspect x-interact-tracker | grep -A 5 Health`
+- **Enter Container**: `docker exec -it x-interact-tracker /bin/bash`
+- **View Resource Usage**: `docker stats x-interact-tracker`
+- **Restore Backup**: `cp backups/tracker_state_YYYYMMDD_HHMMSS.json tracker_state.json`

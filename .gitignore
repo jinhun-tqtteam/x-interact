@@ -61,6 +61,7 @@ data/
 *.json.backup
 *.json.bak
 tracker_state.json
+backups/
 logs/
 *.log
 
