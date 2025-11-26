@@ -58,6 +58,8 @@ class Settings:
     webhook_timeout: int = 10
     # NEW: Timeout for tweet fetching
     tweet_fetch_timeout: int = 20
+    # NEW: Limit for number of tweets to fetch
+    tweet_fetch_limit: int = 5
 
 
 def get_settings() -> Settings:
@@ -89,6 +91,7 @@ def get_settings() -> Settings:
     proxy_health_check_timeout = int(os.getenv("PROXY_HEALTH_CHECK_TIMEOUT", "10"))
     webhook_timeout = int(os.getenv("WEBHOOK_TIMEOUT", "10"))
     tweet_fetch_timeout = int(os.getenv("TWEET_FETCH_TIMEOUT", "20"))
+    tweet_fetch_limit = int(os.getenv("TWEET_FETCH_LIMIT", "5"))
 
     return Settings(
         accounts_config=accounts_config,
@@ -105,6 +108,7 @@ def get_settings() -> Settings:
         proxy_health_check_timeout=proxy_health_check_timeout,
         webhook_timeout=webhook_timeout,
         tweet_fetch_timeout=tweet_fetch_timeout,
+        tweet_fetch_limit=tweet_fetch_limit,
     )
 
 
@@ -571,6 +575,7 @@ def get_latest_tweets_for_user_with_account(
     user: TrackedUser,
     account: TwitterAccount,
     timeout: int = 20,
+    fetch_limit: int = 20,
     limit: int = 5,
 ) -> List[Dict[str, Any]]:
     """
@@ -588,7 +593,7 @@ def get_latest_tweets_for_user_with_account(
         # Run in executor with timeout
         executor = ThreadPoolExecutor(max_workers=1)
         future = executor.submit(
-            lambda: scraper.tweets([user_id_int], limit=20, save=False, pbar=False)
+            lambda: scraper.tweets([user_id_int], limit=fetch_limit, save=False, pbar=False)
         )
         
         try:
@@ -608,7 +613,9 @@ def get_latest_tweets_for_user_with_account(
         if not isinstance(tweets, list):
             return []
 
-        return tweets[:limit]
+        result = tweets[:limit]
+        debug_log(f"[{account.name}] Returning {len(result)} tweets (limit={limit})")
+        return result
 
     except TimeoutError:
         raise
@@ -714,13 +721,14 @@ def process_user_tweets(
             last_seen_id_str = user_state.get("last_tweet_id")
             last_seen_id = int(last_seen_id_str) if last_seen_id_str else None
 
-            # FIXED: Pass timeout parameter
+            # FIXED: Pass timeout and fetch limit parameters
             tweets = get_latest_tweets_for_user_with_account(
                 scraper, 
                 user, 
                 account,
                 timeout=settings.tweet_fetch_timeout,
-                limit=5
+                fetch_limit=settings.tweet_fetch_limit,
+                limit=settings.tweet_fetch_limit
             )
             
             if not tweets:
@@ -792,6 +800,7 @@ def main():
     print(f"[config] Tracking users: {settings.target_users}")
     print(f"[config] Poll interval: {settings.poll_interval}s")
     print(f"[config] Tweet fetch timeout: {settings.tweet_fetch_timeout}s")
+    print(f"[config] Tweet fetch limit: {settings.tweet_fetch_limit}")
     print(f"[config] Account rotation: {settings.account_rotation_strategy}")
     print(f"[config] Proxy rotation: {settings.enable_proxy_rotation}")
     if DEBUG:
